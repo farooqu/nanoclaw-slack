@@ -37,6 +37,8 @@ export class SlackChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  // 'channelId:threadTs' entries blocked from threading (via /no-thread prefix)
+  private noThreadSet = new Set<string>();
 
   private opts: SlackChannelOpts;
 
@@ -79,23 +81,70 @@ export class SlackChannel implements Channel {
 
       if (!msg.text) return;
 
-      // Threaded replies are flattened into the channel conversation.
-      // The agent sees them alongside channel-level messages; responses
-      // always go to the channel, not back into the thread.
+      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
-      const jid = `slack:${msg.channel}`;
-      const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
+      const channelId = msg.channel;
+      const channelJid = `slack:${channelId}`;
+      const msgTs = msg.ts;
+      const msgThreadTs = (msg as { thread_ts?: string }).thread_ts;
+      const isThreadReply = !!msgThreadTs && msgThreadTs !== msgTs;
+      const timestamp = new Date(parseFloat(msgTs) * 1000).toISOString();
       const isGroup = msg.channel_type !== 'im';
 
-      // Always report metadata for group discovery
-      this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', isGroup);
+      // Always report channel metadata for group discovery
+      this.opts.onChatMetadata(channelJid, timestamp, undefined, 'slack', isGroup);
 
-      // Only deliver full messages for registered groups
       const groups = this.opts.registeredGroups();
-      if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      // Determine the effective JID and thread routing
+      let jid: string;
+      let content = msg.text;
+
+      if (isThreadReply) {
+        // Thread reply: use thread JID unless this thread_ts is blocked (/no-thread)
+        const blocked = this.noThreadSet.has(`${channelId}:${msgThreadTs}`);
+        jid = blocked ? channelJid : `${channelJid}:thread:${msgThreadTs}`;
+      } else {
+        // Root channel message: default to threading unless /no-thread prefix
+        if (!isBotMessage && content.trimStart().startsWith('/no-thread')) {
+          // Opt out: respond in channel, block this thread_ts for all future replies
+          this.noThreadSet.add(`${channelId}:${msgTs}`);
+          content = content.replace(/^\/no-thread\s*/i, '').trim();
+          jid = channelJid;
+        } else {
+          // Default: route to thread JID — bot's first reply will create the thread
+          jid = `${channelJid}:thread:${msgTs}`;
+        }
+      }
+
+      // For thread JIDs: only deliver if the parent channel is registered.
+      // For channel JIDs: only deliver if the channel itself is registered.
+      const parentJid = jid.includes(':thread:') ? channelJid : jid;
+      if (!groups[parentJid]) return;
+
+      // Auto-register thread group on first message.
+      // Thread groups share the parent's folder (same CLAUDE.md, tools, mounts)
+      // but get a unique sessionKey so index.ts gives each thread its own Claude session.
+      if (jid !== channelJid && !groups[jid]) {
+        const { threadTs: tTs } = this.parseSlackJid(jid);
+        if (tTs) {
+          const parentGroup = groups[channelJid];
+          const sessionKey = this.getThreadSessionKey(parentGroup.folder, tTs);
+          // Mutate the live registeredGroups reference — visible to index.ts immediately.
+          // folder stays as parentGroup.folder so the container uses the parent's
+          // CLAUDE.md, tools, and mounts; sessionKey is unique per thread.
+          groups[jid] = { ...parentGroup, sessionKey, requiresTrigger: false };
+          logger.info(
+            { jid, sessionKey, parentFolder: parentGroup.folder },
+            'Slack thread group registered',
+          );
+        }
+      }
+
+      // Report thread JID metadata so message storage can find the chat entry
+      if (jid !== channelJid) {
+        this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', isGroup);
+      }
 
       let senderName: string;
       if (isBotMessage) {
@@ -110,7 +159,6 @@ export class SlackChannel implements Channel {
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
       // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
       // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
-      let content = msg.text;
       if (this.botUserId && !isBotMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
         if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
@@ -119,7 +167,7 @@ export class SlackChannel implements Channel {
       }
 
       this.opts.onMessage(jid, {
-        id: msg.ts,
+        id: msgTs,
         chat_jid: jid,
         sender: msg.user || msg.bot_id || '',
         sender_name: senderName,
@@ -158,7 +206,7 @@ export class SlackChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
-    const channelId = jid.replace(/^slack:/, '');
+    const { channelId, threadTs } = this.parseSlackJid(jid);
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text });
@@ -172,12 +220,17 @@ export class SlackChannel implements Channel {
     try {
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          text,
+          ...(threadTs ? { thread_ts: threadTs } : {}),
+        });
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
             channel: channelId,
             text: text.slice(i, i + MAX_MESSAGE_LENGTH),
+            ...(threadTs ? { thread_ts: threadTs } : {}),
           });
         }
       }
@@ -189,6 +242,33 @@ export class SlackChannel implements Channel {
         'Failed to send Slack message, queued',
       );
     }
+  }
+
+  /**
+   * Parse a Slack JID into its channel ID and optional thread timestamp.
+   * Handles both channel JIDs (slack:CHANNEL) and thread JIDs (slack:CHANNEL:thread:THREAD_TS).
+   */
+  private parseSlackJid(jid: string): { channelId: string; threadTs?: string } {
+    const sep = ':thread:';
+    const idx = jid.indexOf(sep);
+    if (idx !== -1) {
+      return {
+        channelId: jid.slice('slack:'.length, idx),
+        threadTs: jid.slice(idx + sep.length),
+      };
+    }
+    return { channelId: jid.slice('slack:'.length) };
+  }
+
+  /**
+   * Derive a unique session key for a Slack thread.
+   * Format: {parentFolder}_t_{sanitized_thread_ts}, max 64 chars.
+   * Used as the session key (not the folder) so each thread gets an isolated
+   * Claude session while still running against the parent group's folder.
+   */
+  private getThreadSessionKey(parentFolder: string, threadTs: string): string {
+    const sanitized = threadTs.replace(/\./g, '_');
+    return `${parentFolder}_t_${sanitized}`.slice(0, 64);
   }
 
   isConnected(): boolean {
@@ -274,10 +354,11 @@ export class SlackChannel implements Channel {
       );
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
-        const channelId = item.jid.replace(/^slack:/, '');
+        const { channelId, threadTs } = this.parseSlackJid(item.jid);
         await this.app.client.chat.postMessage({
           channel: channelId,
           text: item.text,
+          ...(threadTs ? { thread_ts: threadTs } : {}),
         });
         logger.info(
           { jid: item.jid, length: item.text.length },

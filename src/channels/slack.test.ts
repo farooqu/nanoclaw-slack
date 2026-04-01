@@ -91,17 +91,20 @@ import { readEnvFile } from '../env.js';
 function createTestOpts(
   overrides?: Partial<SlackChannelOpts>,
 ): SlackChannelOpts {
+  // Return a *persistent* mutable object so thread auto-registration mutations
+  // are visible within the same event handler invocation (mirrors index.ts behaviour).
+  const groups: Record<string, any> = {
+    'slack:C0123456789': {
+      name: 'Test Channel',
+      folder: 'test-channel',
+      trigger: '@Jonesy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    },
+  };
   return {
     onMessage: vi.fn(),
     onChatMetadata: vi.fn(),
-    registeredGroups: vi.fn(() => ({
-      'slack:C0123456789': {
-        name: 'Test Channel',
-        folder: 'test-channel',
-        trigger: '@Jonesy',
-        added_at: '2024-01-01T00:00:00.000Z',
-      },
-    })),
+    registeredGroups: vi.fn(() => groups),
     ...overrides,
   };
 }
@@ -206,6 +209,7 @@ describe('SlackChannel', () => {
       const event = createMessageEvent({ text: 'Hello everyone' });
       await triggerMessageEvent(event);
 
+      // Channel metadata always reported for group discovery
       expect(opts.onChatMetadata).toHaveBeenCalledWith(
         'slack:C0123456789',
         expect.any(String),
@@ -213,11 +217,12 @@ describe('SlackChannel', () => {
         'slack',
         true,
       );
+      // Root messages route to a thread JID so the bot reply creates a thread
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           id: '1704067200.000000',
-          chat_jid: 'slack:C0123456789',
+          chat_jid: 'slack:C0123456789:thread:1704067200.000000',
           sender: 'U_USER_456',
           content: 'Hello everyone',
           is_from_me: false,
@@ -293,9 +298,9 @@ describe('SlackChannel', () => {
       });
       await triggerMessageEvent(event);
 
-      // Has bot_id so should be marked as bot message
+      // Has bot_id so should be marked as bot message; root message routes to thread JID
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           is_from_me: true,
           is_bot_message: true,
@@ -313,7 +318,7 @@ describe('SlackChannel', () => {
       await triggerMessageEvent(event);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           is_from_me: true,
           is_bot_message: true,
@@ -359,7 +364,7 @@ describe('SlackChannel', () => {
       await triggerMessageEvent(event);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           timestamp: '2024-01-01T00:00:00.000Z',
         }),
@@ -378,7 +383,7 @@ describe('SlackChannel', () => {
         user: 'U_USER_456',
       });
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           sender_name: 'Alice Smith',
         }),
@@ -413,35 +418,42 @@ describe('SlackChannel', () => {
       await triggerMessageEvent(event);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           sender_name: 'U_UNKNOWN',
         }),
       );
     });
 
-    it('flattens threaded replies into channel messages', async () => {
+    it('thread reply routes to thread JID using parent thread_ts', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      const event = createMessageEvent({
+      // First trigger the root so the thread group gets registered
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: 'Root message',
+      }));
+
+      const reply = createMessageEvent({
         ts: '1704067201.000000',
-        threadTs: '1704067200.000000', // parent message ts — this is a reply
+        threadTs: '1704067200.000000', // parent message ts
         text: 'Thread reply',
       });
-      await triggerMessageEvent(event);
+      await triggerMessageEvent(reply);
 
-      // Threaded replies are delivered as regular channel messages
+      // Reply routes to the same thread JID as the root
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
+          id: '1704067201.000000',
           content: 'Thread reply',
         }),
       );
     });
 
-    it('delivers thread parent messages normally', async () => {
+    it('thread parent (thread_ts == ts) routes to its own thread JID', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
@@ -453,8 +465,9 @@ describe('SlackChannel', () => {
       });
       await triggerMessageEvent(event);
 
+      // thread_ts == ts counts as a root message → routes to thread JID
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           content: 'Thread parent',
         }),
@@ -488,7 +501,7 @@ describe('SlackChannel', () => {
       await triggerMessageEvent(event);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           content: '@Jonesy Hey <@U_BOT_123> what do you think?',
         }),
@@ -508,7 +521,7 @@ describe('SlackChannel', () => {
 
       // Content should be unchanged since it already matches TRIGGER_PATTERN
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           content: '@Jonesy <@U_BOT_123> hello',
         }),
@@ -529,7 +542,7 @@ describe('SlackChannel', () => {
 
       // Bot messages skip mention translation
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           content: 'Echo: <@U_BOT_123>',
         }),
@@ -549,7 +562,7 @@ describe('SlackChannel', () => {
 
       // Mention is for a different user, not the bot
       expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C0123456789',
+        'slack:C0123456789:thread:1704067200.000000',
         expect.objectContaining({
           content: 'Hey <@U_OTHER_USER> look at this',
         }),
@@ -683,12 +696,226 @@ describe('SlackChannel', () => {
     });
   });
 
+  // --- Threading ---
+
+  describe('threading', () => {
+    it('root message routes to thread JID by default', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: 'Normal message',
+      }));
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789:thread:1704067200.000000',
+        expect.objectContaining({ content: 'Normal message' }),
+      );
+    });
+
+    it('/no-thread prefix routes root message to channel JID and strips prefix', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: '/no-thread hello channel',
+      }));
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({ content: 'hello channel' }),
+      );
+    });
+
+    it('/no-thread blocks subsequent replies to that thread from threading', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Root message opts out of threading
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: '/no-thread original',
+      }));
+
+      // Reply to that same thread_ts
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067201.000000',
+        threadTs: '1704067200.000000',
+        text: 'Reply to no-thread root',
+      }));
+
+      // Both calls should use the channel JID
+      const calls = vi.mocked(opts.onMessage).mock.calls;
+      expect(calls[0][0]).toBe('slack:C0123456789');
+      expect(calls[1][0]).toBe('slack:C0123456789');
+    });
+
+    it('thread reply to unblocked root routes to thread JID', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Root message (creates thread group)
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: 'Root',
+      }));
+
+      // Reply
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067201.000000',
+        threadTs: '1704067200.000000',
+        text: 'Reply',
+      }));
+
+      const calls = vi.mocked(opts.onMessage).mock.calls;
+      expect(calls[0][0]).toBe('slack:C0123456789:thread:1704067200.000000');
+      expect(calls[1][0]).toBe('slack:C0123456789:thread:1704067200.000000');
+    });
+
+    it('thread auto-registration sets sessionKey unique per thread', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: 'Root',
+      }));
+
+      const groups = opts.registeredGroups();
+      const threadGroup = groups['slack:C0123456789:thread:1704067200.000000'];
+
+      expect(threadGroup).toBeDefined();
+      // Unique session key for thread isolation
+      expect(threadGroup.sessionKey).toBe('test-channel_t_1704067200_000000');
+      // But folder stays as the parent's so container uses parent CLAUDE.md
+      expect(threadGroup.folder).toBe('test-channel');
+      // No trigger required — any thread message should fire the agent
+      expect(threadGroup.requiresTrigger).toBe(false);
+    });
+
+    it('two different threads get different session keys', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({ ts: '1704067200.000000', text: 'A' }));
+      await triggerMessageEvent(createMessageEvent({ ts: '1704067300.000000', text: 'B' }));
+
+      const groups = opts.registeredGroups();
+      const keyA = groups['slack:C0123456789:thread:1704067200.000000']?.sessionKey;
+      const keyB = groups['slack:C0123456789:thread:1704067300.000000']?.sessionKey;
+
+      expect(keyA).not.toBe(keyB);
+    });
+
+    it('thread metadata reported to onChatMetadata', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: 'Root',
+      }));
+
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'slack:C0123456789:thread:1704067200.000000',
+        expect.any(String),
+        undefined,
+        'slack',
+        true,
+      );
+    });
+  });
+
+  // --- sendMessage with thread JIDs ---
+
+  describe('sendMessage thread JIDs', () => {
+    it('sends to thread when JID contains :thread:', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('slack:C0123456789:thread:1704067200.000000', 'Thread reply');
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Thread reply',
+        thread_ts: '1704067200.000000',
+      });
+    });
+
+    it('splits long thread messages with thread_ts on every chunk', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const longText = 'X'.repeat(4500);
+      await channel.sendMessage('slack:C0123456789:thread:1704067200.000000', longText);
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledTimes(2);
+      expect(currentApp().client.chat.postMessage).toHaveBeenNthCalledWith(1, {
+        channel: 'C0123456789',
+        text: 'X'.repeat(4000),
+        thread_ts: '1704067200.000000',
+      });
+      expect(currentApp().client.chat.postMessage).toHaveBeenNthCalledWith(2, {
+        channel: 'C0123456789',
+        text: 'X'.repeat(500),
+        thread_ts: '1704067200.000000',
+      });
+    });
+
+    it('flushes queued thread messages with thread_ts on reconnect', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+
+      // Queue while disconnected
+      await channel.sendMessage('slack:C0123456789:thread:1704067200.000000', 'Queued thread reply');
+
+      expect(currentApp().client.chat.postMessage).not.toHaveBeenCalled();
+
+      await channel.connect();
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Queued thread reply',
+        thread_ts: '1704067200.000000',
+      });
+    });
+
+    it('channel JID (no :thread:) sends without thread_ts', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('slack:C0123456789', 'Channel message');
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Channel message',
+      });
+    });
+  });
+
   // --- ownsJid ---
 
   describe('ownsJid', () => {
     it('owns slack: JIDs', () => {
       const channel = new SlackChannel(createTestOpts());
       expect(channel.ownsJid('slack:C0123456789')).toBe(true);
+    });
+
+    it('owns slack: thread JIDs', () => {
+      const channel = new SlackChannel(createTestOpts());
+      expect(channel.ownsJid('slack:C0123456789:thread:1704067200.000000')).toBe(true);
     });
 
     it('owns slack: DM JIDs', () => {
