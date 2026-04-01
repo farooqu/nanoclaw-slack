@@ -342,7 +342,8 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const sk = group.sessionKey ?? group.folder;
+  const sessionId = sessions[sk];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -374,8 +375,8 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions[sk] = output.newSessionId;
+          setSession(sk, output.newSessionId);
         }
         await onOutput(output);
       }
@@ -398,8 +399,8 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[sk] = output.newSessionId;
+      setSession(sk, output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -417,8 +418,8 @@ async function runAgent(
           { group: group.name, staleSessionId: sessionId, error: output.error },
           'Stale session detected — clearing for next retry',
         );
-        delete sessions[group.folder];
-        deleteSession(group.folder);
+        delete sessions[sk];
+        deleteSession(sk);
       }
 
       logger.error(
